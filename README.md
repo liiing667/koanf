@@ -594,6 +594,32 @@ For example: merging JSON and YAML will most likely fail because JSON treats int
 - Config keys are case-sensitive in koanf. For example, `app.server.port` and `APP.SERVER.port` are not the same.
 - koanf does not impose any ordering on loading config from various providers. Every successive `Load()` or `Merge()` merges new config into the existing config. That is, it is possible to load environment variables first, then files on top of it, and then command line variables on top of it, or any such order.
 
+### Observing merge provenance
+
+Every `Load()` / `Merge()` / `Set()` is recorded as a numbered "layer". An optional human-readable name can be attached to a `Load()` with the `koanf.WithLayer()` option. `Provenance()` (or the printable `SprintProvenance()`) then reports, for every leaf key in the merged config, which layer produced its current value and which layer's value it overrode. The observation reflects the actual merged state (keys removed by `Delete()` or a custom merge function disappear) and is purely observational — it never changes any values or merge behavior.
+
+```go
+k.Load(file.Provider("base.json"), parser, koanf.WithLayer("base.json"))
+k.Load(env.Provider(".", env.Opt{Prefix: "APP_"}), nil, koanf.WithLayer("env"))
+
+fmt.Print(k.SprintProvenance())
+// server.port -> 8080 (from layer #1 (env), overrode 80 from layer #0 (base.json))
+// server.host -> localhost (from layer #0 (base.json))
+```
+
+### Strict unmarshalling
+
+By default, unmarshalling into structs is lenient: unknown config keys are ignored and values are weakly type-converted. Setting `Strict: true` in `UnmarshalConf` makes `UnmarshalWithConf()` fail when the config contains keys that don't exist in the target struct, and disables weak type conversions so type mismatches (eg: a string where a number is expected, a scalar where a slice is expected) return errors carrying the full key path and the expected type. Strict mode only affects unmarshalling; `Get()`, `All()` etc. are unaffected.
+
+```go
+var out struct {
+	Port int `koanf:"port"`
+}
+err := k.UnmarshalWithConf("", &out, koanf.UnmarshalConf{Strict: true})
+// 'port' expected type 'int', got unconvertible type 'string' ...
+// or: ... has invalid keys: unknown.key
+```
+
 ### Custom Providers and Parsers
 
 A Provider returns a nested `map[string]any` config that can be loaded directly into koanf with `koanf.Load()` or it can return raw bytes that can be parsed with a Parser (again, loaded using `koanf.Load()`. Writing Providers and Parsers are easy. See the bundled implementations in the [providers](https://github.com/knadh/koanf/tree/master/providers) and [parsers](https://github.com/knadh/koanf/tree/master/parsers) directories.

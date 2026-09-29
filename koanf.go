@@ -22,6 +22,16 @@ type Koanf struct {
 	keyMap      KeyMap
 	conf        Conf
 	mu          sync.RWMutex
+
+	// provenance tracks, for every flattened leaf key, which
+	// load/merge layer produced its current value and what it
+	// overrode. It is maintained purely for observation and never
+	// influences values or merges.
+	provenance map[string]Provenance
+
+	// layerSeq is the 0-based sequence number of the next
+	// load/merge event.
+	layerSeq int
 }
 
 // Conf is the Koanf configuration.
@@ -65,6 +75,16 @@ type UnmarshalConf struct {
 	// ```
 	FlatPaths     bool
 	DecoderConfig *mapstructure.DecoderConfig
+
+	// Strict enables strict decoding. When true, Unmarshal errors
+	// if the config contains keys that don't exist in the target
+	// struct (reporting the full key path), and weak type
+	// conversions are disabled so that type mismatches (eg: a
+	// string where a number is expected, or a scalar where a slice
+	// is expected) error with the full key path and expected type.
+	// It only affects unmarshalling; Get(), All() etc. are
+	// unaffected. Defaults to false.
+	Strict bool
 }
 
 // New returns a new instance of Koanf. delim is the delimiter to use
@@ -84,6 +104,7 @@ func NewWithConf(conf Conf) *Koanf {
 		confMapFlat: make(map[string]any),
 		keyMap:      make(KeyMap),
 		conf:        conf,
+		provenance:  make(map[string]Provenance),
 	}
 }
 
@@ -273,6 +294,14 @@ func (ko *Koanf) UnmarshalWithConf(path string, o any, c UnmarshalConf) error {
 		}
 	}
 
+	// Strict decoding: error on config keys that don't map to
+	// struct fields and disable weak type conversions so type
+	// mismatches surface as errors with full key paths.
+	if c.Strict {
+		c.DecoderConfig.ErrorUnused = true
+		c.DecoderConfig.WeaklyTypedInput = false
+	}
+
 	c.DecoderConfig.Result = o
 
 	if c.Tag == "" {
@@ -310,6 +339,8 @@ func (ko *Koanf) Delete(path string) {
 		ko.confMap = make(map[string]any)
 		ko.confMapFlat = make(map[string]any)
 		ko.keyMap = make(KeyMap)
+		ko.provenance = make(map[string]Provenance)
+		ko.layerSeq = 0
 		return
 	}
 
@@ -323,6 +354,7 @@ func (ko *Koanf) Delete(path string) {
 	// Update the flattened version as well.
 	ko.confMapFlat, ko.keyMap = maps.Flatten(ko.confMap, nil, ko.conf.Delim)
 	ko.keyMap = populateKeyParts(ko.keyMap, ko.conf.Delim)
+	ko.pruneProvenanceLocked()
 }
 
 // Get returns the raw, uncast any value of a given key path
@@ -460,6 +492,9 @@ func (ko *Koanf) merge(c map[string]any, opts *options) error {
 	// Maintain a flattened version as well.
 	ko.confMapFlat, ko.keyMap = maps.Flatten(ko.confMap, nil, ko.conf.Delim)
 	ko.keyMap = populateKeyParts(ko.keyMap, ko.conf.Delim)
+
+	// Observe the merged state and record per-key provenance.
+	ko.observeLocked(opts.layer)
 
 	ko.mu.Unlock()
 	return nil
