@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/go-viper/mapstructure/v2"
@@ -21,6 +22,8 @@ type Koanf struct {
 	confMapFlat map[string]any
 	keyMap      KeyMap
 	conf        Conf
+	prov        map[string]*Provenance
+	loads       int
 	mu          sync.RWMutex
 }
 
@@ -46,6 +49,59 @@ type Conf struct {
 // parent => [parent]
 type KeyMap map[string][]string
 
+// Origin describes a single config layer's contribution to a key:
+// which layer produced the value and what the value was.
+type Origin struct {
+	// Source is the name of the layer (see WithSource) that set the value.
+	Source string
+
+	// Value is the value the layer set for the key.
+	Value any
+}
+
+// Provenance describes the lineage of a single flattened config key in
+// the merged configuration: which layer the current value came from and
+// which earlier values (and layers) it overrode. It is purely
+// observational and reflects the real merged state, including keys that
+// were overridden or deleted.
+type Provenance struct {
+	// Key is the flattened, delimited key path.
+	Key string
+
+	// Source is the name of the layer that produced the current value.
+	Source string
+
+	// Value is the current value of the key. If Deleted is true, it is
+	// the last value the key had before it was deleted.
+	Value any
+
+	// Deleted is true if the key no longer exists in the merged config,
+	// either because it was explicitly deleted or because a parent key
+	// was replaced by a later layer.
+	Deleted bool
+
+	// History lists the values (and their layers) that were overridden
+	// by later layers, oldest first.
+	History []Origin
+}
+
+// String returns a single-line, human readable representation of the
+// key's provenance, for eg:
+// `server.port -> 8080 (from env; overrides 80 from defaults)`.
+func (p Provenance) String() string {
+	var b strings.Builder
+	if p.Deleted {
+		fmt.Fprintf(&b, "%s -> <deleted> (last value %v from %s", p.Key, p.Value, p.Source)
+	} else {
+		fmt.Fprintf(&b, "%s -> %v (from %s", p.Key, p.Value, p.Source)
+	}
+	for _, o := range p.History {
+		fmt.Fprintf(&b, "; overrides %v from %s", o.Value, o.Source)
+	}
+	b.WriteString(")")
+	return b.String()
+}
+
 // UnmarshalConf represents configuration options used by
 // Unmarshal() to unmarshal conf maps into arbitrary structs.
 type UnmarshalConf struct {
@@ -65,6 +121,14 @@ type UnmarshalConf struct {
 	// ```
 	FlatPaths     bool
 	DecoderConfig *mapstructure.DecoderConfig
+
+	// Strict, when true, makes decoding strict: keys present in the
+	// configuration that have no corresponding struct field produce an
+	// error naming the full key path, and values whose types do not
+	// match the target field types produce an error naming the path and
+	// the expected type (weak type conversion is disabled). It only
+	// affects decoding; getters such as All() and Get() are unaffected.
+	Strict bool
 }
 
 // New returns a new instance of Koanf. delim is the delimiter to use
@@ -83,6 +147,7 @@ func NewWithConf(conf Conf) *Koanf {
 		confMap:     make(map[string]any),
 		confMapFlat: make(map[string]any),
 		keyMap:      make(KeyMap),
+		prov:        make(map[string]*Provenance),
 		conf:        conf,
 	}
 }
@@ -242,7 +307,7 @@ func (ko *Koanf) Set(key string, val any) error {
 		key: val,
 	}, ko.conf.Delim)
 
-	return ko.merge(n, new(options))
+	return ko.merge(n, newOptions([]Option{WithSource("set")}))
 }
 
 // Marshal takes a Parser implementation and marshals the config map into bytes,
@@ -271,6 +336,14 @@ func (ko *Koanf) UnmarshalWithConf(path string, o any, c UnmarshalConf) error {
 			Metadata:         nil,
 			WeaklyTypedInput: true,
 		}
+	}
+
+	if c.Strict {
+		// Error on config keys that have no corresponding struct field
+		// and disable weak type conversion so that type mismatches
+		// produce errors carrying the key path and the expected type.
+		c.DecoderConfig.ErrorUnused = true
+		c.DecoderConfig.WeaklyTypedInput = false
 	}
 
 	c.DecoderConfig.Result = o
@@ -310,6 +383,7 @@ func (ko *Koanf) Delete(path string) {
 		ko.confMap = make(map[string]any)
 		ko.confMapFlat = make(map[string]any)
 		ko.keyMap = make(KeyMap)
+		ko.reconcileProvenance()
 		return
 	}
 
@@ -323,6 +397,9 @@ func (ko *Koanf) Delete(path string) {
 	// Update the flattened version as well.
 	ko.confMapFlat, ko.keyMap = maps.Flatten(ko.confMap, nil, ko.conf.Delim)
 	ko.keyMap = populateKeyParts(ko.keyMap, ko.conf.Delim)
+
+	// Mark the deleted keys in the provenance records.
+	ko.reconcileProvenance()
 }
 
 // Get returns the raw, uncast any value of a given key path
@@ -461,8 +538,108 @@ func (ko *Koanf) merge(c map[string]any, opts *options) error {
 	ko.confMapFlat, ko.keyMap = maps.Flatten(ko.confMap, nil, ko.conf.Delim)
 	ko.keyMap = populateKeyParts(ko.keyMap, ko.conf.Delim)
 
+	// Record the provenance of the merged layer against the real
+	// post-merge state. This is purely observational and does not
+	// influence the merged values in any way.
+	source := opts.source
+	if source == "" {
+		source = fmt.Sprintf("load#%d", ko.loads)
+	}
+	ko.loads++
+	ko.recordProvenance(c, source)
+
 	ko.mu.Unlock()
 	return nil
+}
+
+// recordProvenance observes the flattened keys of a freshly merged layer
+// and records, for each key, which layer its current value came from and
+// which earlier values it overrode. Keys that no longer exist in the
+// merged config (deleted or wiped out by a parent being replaced) are
+// marked deleted. It must be called with ko.mu held, after confMapFlat
+// has been recomputed, so that the recorded state always reflects the
+// real merged state rather than a replay of the inputs.
+func (ko *Koanf) recordProvenance(c map[string]any, source string) {
+	flat, _ := maps.Flatten(c, nil, ko.conf.Delim)
+	for k := range flat {
+		v, ok := ko.confMapFlat[k]
+		if !ok {
+			// A custom merge function may have dropped the key.
+			// Only record what actually landed in the merged map.
+			continue
+		}
+		rec, ok := ko.prov[k]
+		if !ok {
+			rec = &Provenance{Key: k}
+			ko.prov[k] = rec
+		} else {
+			rec.History = append(rec.History, Origin{Source: rec.Source, Value: rec.Value})
+		}
+		rec.Value = v
+		rec.Source = source
+		rec.Deleted = false
+	}
+	ko.reconcileProvenance()
+}
+
+// reconcileProvenance marks provenance records whose keys no longer
+// exist in the merged config as deleted. It must be called with ko.mu
+// held, after confMapFlat has been recomputed.
+func (ko *Koanf) reconcileProvenance() {
+	for k, rec := range ko.prov {
+		if _, ok := ko.confMapFlat[k]; !ok {
+			rec.Deleted = true
+		}
+	}
+}
+
+// Provenance returns the lineage of every flattened key ever observed,
+// sorted by key, including keys that were overridden or deleted. The
+// result is a snapshot copy and safe to mutate.
+func (ko *Koanf) Provenance() []Provenance {
+	ko.mu.RLock()
+	out := make([]Provenance, 0, len(ko.prov))
+	for _, rec := range ko.prov {
+		cp := *rec
+		cp.History = append([]Origin(nil), rec.History...)
+		out = append(out, cp)
+	}
+	ko.mu.RUnlock()
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
+// ProvenanceOf returns the lineage of a single flattened key path.
+// The second return value is false if the key was never observed.
+func (ko *Koanf) ProvenanceOf(path string) (Provenance, bool) {
+	ko.mu.RLock()
+	defer ko.mu.RUnlock()
+
+	rec, ok := ko.prov[path]
+	if !ok {
+		return Provenance{}, false
+	}
+	cp := *rec
+	cp.History = append([]Origin(nil), rec.History...)
+	return cp, true
+}
+
+// SprintProvenance returns a printable, line-per-key representation of
+// the provenance of all keys, sorted alphabetically.
+func (ko *Koanf) SprintProvenance() string {
+	b := bytes.Buffer{}
+	for _, p := range ko.Provenance() {
+		b.WriteString(p.String())
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// PrintProvenance prints a line-per-key representation of the provenance
+// of all keys, sorted alphabetically.
+func (ko *Koanf) PrintProvenance() {
+	fmt.Print(ko.SprintProvenance())
 }
 
 // toInt64 takes an interface value and if it is an integer type,
